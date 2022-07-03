@@ -8,6 +8,7 @@ from .torch_edge import DenseDilatedKnnGraph
 from .pos_embed import get_2d_relative_pos_embed
 import torch.nn.functional as F
 from timm.models.layers import DropPath
+import pdb
 
 
 class MRConv2d(nn.Module):
@@ -19,6 +20,7 @@ class MRConv2d(nn.Module):
         self.nn = BasicConv([in_channels*2, out_channels], act, norm, bias)
 
     def forward(self, x, edge_index, y=None):
+        pdb.set_trace()
         x_i = batched_index_select(x, edge_index[1])
         if y is not None:
             x_j = batched_index_select(y, edge_index[0])
@@ -77,6 +79,7 @@ class GINConv2d(nn.Module):
         self.eps = nn.Parameter(torch.Tensor([eps_init]))
 
     def forward(self, x, edge_index, y=None):
+
         if y is not None:
             x_j = batched_index_select(y, edge_index[0])
         else:

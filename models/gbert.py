@@ -15,7 +15,8 @@ from timm.models.resnet import resnet26d, resnet50d
 from timm.models.registry import register_model
 
 
-from gcn_lib import Grapher, act_layer
+from gbert_lib import Grapher, act_layer
+import pdb
 
 
 def _cfg(url='', **kwargs):
@@ -269,3 +270,8 @@ def pvig_b_224_gelu(pretrained=False, **kwargs):
     model = DeepGCN(opt)
     model.default_cfg = default_cfgs['vig_b_224_gelu']
     return model
+
+if __name__ == "__main__":
+    model = pvig_s_224_gelu()
+    img = torch.randn(16, 3, 224, 224)
+    model(img)
