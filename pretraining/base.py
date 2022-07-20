@@ -21,10 +21,13 @@ import os
 
 from transformers import BertTokenizer, RobertaTokenizer
 
-from pretraining.configs import PretrainedBertConfig, PretrainedRobertaConfig
+from pretraining.configs import PretrainedBertConfig, PretrainedRobertaConfig, GbertConfig
 from pretraining.modeling import BertForPreTraining, BertLMHeadModel
 from pretraining.utils import to_sanitized_dict
-
+from pretraining.gbert import GraphBert
+# from pretraining.modeling_augskip import BertForPreTraining as BertAugSkipForPreTraining
+# from pretraining.modeling_augskip import BertLMHeadModel as BertLMHeadAugSkipModel
+import pdb
 logger = logging.getLogger(__name__)
 
 
@@ -32,6 +35,8 @@ MODELS = {
     "bert-mlm": (BertLMHeadModel, PretrainedBertConfig, BertTokenizer),
     "bert-mlm-roberta": (BertLMHeadModel, PretrainedRobertaConfig, RobertaTokenizer),
     "bert-mlm-nsp": (BertForPreTraining, PretrainedBertConfig, BertTokenizer),
+    # 'bert-mlm-augskip': (BertLMHeadAugSkipModel, PretrainedBertConfig, BertTokenizer)
+    "gbert-mlm":(GraphBert, GbertConfig, BertTokenizer)
 }
 
 
@@ -55,6 +60,7 @@ class BasePretrainModel(object):
         self.ds_file = args.ds_config if hasattr(args, "ds_config") else None
 
         if not tokenizer:
+            # pdb.set_trace()
             if model_name_or_path is None:
                 loading_path = args.tokenizer_name
                 logger.info(f"Loading default tokenizer {loading_path}")

@@ -21,7 +21,7 @@ import random
 from pretraining.dataset.bert_dataset_provider import BertDatasetProviderInterface
 from concurrent.futures import ProcessPoolExecutor
 from enum import IntEnum
-
+import pdb
 import h5py
 import numpy as np
 import torch
@@ -230,6 +230,7 @@ class PreTrainingDataset(BertDatasetProviderInterface):
     def get_shard(self, epoch):
         if self.dataset_future is None:
             data_file = self._get_shard_file(epoch)
+
             self.train_dataloader, sample_count = create_pretraining_dataset(
                 input_file=data_file,
                 max_predictions_per_seq=self.max_predictions_per_seq,
@@ -244,13 +245,15 @@ class PreTrainingDataset(BertDatasetProviderInterface):
             )
         else:
             self.train_dataloader, sample_count = self.dataset_future.result(timeout=None)
-
+     #   print(self.global_rank, data_file, "##!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+        #pdb.set_trace()
         return self.train_dataloader, sample_count
 
     def release_shard(self, epoch):
         del self.train_dataloader
 
     def prefetch_shard(self, epoch):
+
         data_file = self._get_shard_file(epoch)
         self.dataset_future = self.pool.submit(
             create_pretraining_dataset,
@@ -277,10 +280,12 @@ class PreTrainingDataset(BertDatasetProviderInterface):
         return self.dataset_files[file_index % self.num_files]
 
     def _get_shard_file_index(self, shard_index, global_rank):
+        global_rank = 0
         if dist.is_initialized() and self.world_size > self.num_files:
             remainder = self.world_size % self.num_files
             file_index = (shard_index * self.world_size) + global_rank + (remainder * shard_index)
         else:
-            file_index = shard_index * self.world_size + global_rank
+            #file_index = shard_index * self.world_size + global_rank
+            file_index = shard_index
 
         return file_index % self.num_files

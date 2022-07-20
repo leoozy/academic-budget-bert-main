@@ -21,16 +21,20 @@ from typing import Any, Dict
 import numpy as np
 import torch
 import torch.distributed as dist
-
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
-    datefmt="%m/%d/%Y %H:%M:%S",
-    level=logging.INFO,
-)
+import os
 
 
 class Logger:
-    def __init__(self, cuda=False):
+    def __init__(self, cuda=False, args=None):
+        if not os.path.exists(args.output_dir):
+            os.mkdir(args.output_dir)
+
+        logging.basicConfig(
+            filename=os.path.join(args.output_dir, 'log.txt'),
+            format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
+            datefmt="%m/%d/%Y %H:%M:%S",
+            level=logging.INFO,
+        )
         self.logger = logging.getLogger(__name__)
         self.cuda = cuda
 
@@ -79,6 +83,11 @@ def is_time_to_finetune(now, start_marker, time_markers, total_time):
         return True
     else:
         return False
+
+def is_to_finetune(is_best, is_last, global_step, max_step):
+    if (is_best or is_last) and (1.0 * global_step / max_step) >= 0.85:
+        return True
+    return False
 
 
 def get_json_file(path):

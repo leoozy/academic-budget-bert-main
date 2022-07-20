@@ -39,6 +39,7 @@ from pretraining.utils import (
     get_time_diff_hours,
     is_time_to_exit,
     is_time_to_finetune,
+    is_to_finetune,
     master_process,
     set_seeds,
 )
@@ -54,302 +55,8 @@ from torch.utils.data.sampler import RandomSampler
 from tqdm import tqdm
 from transformers import HfArgumentParser
 
-logger = Logger(cuda=torch.cuda.is_available())
-
-_has_wandb = False
-try:
-    import wandb
-
-    _has_wandb = True
-except:
-    logger.warning(
-        "W&B logger is not installed, \
-        for advanced logging please install using pip install wandb"
-    )
-
-
-global_step = 0
-global_data_samples = 0
-
-
-def get_valid_dataloader(args, dataset: Dataset):
-    if args.local_rank == -1:
-        train_sampler = RandomSampler(dataset)
-    else:
-        train_sampler = DistributedSampler(dataset)
-    return (
-        x
-        for x in DataLoader(
-            dataset,
-            batch_size=args.validation_micro_batch,
-            sampler=train_sampler,
-            num_workers=0,
-            pin_memory=True,
-        )
-    )
-
-
-validation_shard_index = 0
-
-
-def pretrain_validation(args, model, validation_dataset, step):
-    global validation_shard_index
-
-    logger.info(f"Validation micro batch size: {args.validation_micro_batch}")
-    index = validation_shard_index
-    validation_shard_index += 1
-    model.eval()
-    dataset = validation_dataset.get_validation_set(index)
-    data_batches = get_valid_dataloader(args, dataset)
-    eval_loss = 0
-    num_eval_steps = 0
-    for _, batch in enumerate(tqdm(data_batches, smoothing=1)):
-        batch = tuple(t.to(args.device) for t in batch)
-        total_loss = model.forward(batch)
-
-        torch.cuda.synchronize()
-        # using all_reduce is IMPORTANT! it ensures validation loss consistency across all threads
-        dist.all_reduce(total_loss)
-        total_loss = total_loss / dist.get_world_size()
-        eval_loss += total_loss.mean().item()
-        num_eval_steps += 1
-    eval_loss = eval_loss / num_eval_steps
-
-    logger.info(f"Validation Loss for epoch/step {index + 1}/{step} is: {eval_loss}")
-    if master_process(args):
-        if _has_wandb:
-            log_info = {
-                f"Validation/Loss": eval_loss,
-            }
-            wandb.log(log_info, step=step)
-    del dataset
-    del data_batches
-    del batch
-    model.train()
-    return eval_loss
-
-
-def create_finetune_job(args, index, global_step, model):
-    try:
-
-        checkpoint_id = f"epoch{index}_step{global_step}"
-        model.save_weights(
-            checkpoint_id=checkpoint_id,
-            output_dir=args.saved_model_path,
-            is_deepspeed=args.deepspeed,
-        )
-        logger.info("Saved fine-tuning job.")
-    except Exception as e:
-        logger.warning("Finetune checkpoint failed.")
-        logger.warning(e)
-
-
-def train(
-    args, index, model, optimizer, lr_scheduler, pretrain_dataset_provider, validation_dataset=None
-):
-    global global_step
-    global global_data_samples
-
-    dataset_iterator, total_length = pretrain_dataset_provider.get_shard(index)
-    current_data_sample_count = global_data_samples
-
-    logger.info(
-        f"worker-{dist.get_rank()}: begin epoch {index} current_sample_count {current_data_sample_count} shard_length {total_length} global_data_samples {global_data_samples}"
-    )
-
-    pretrain_dataset_provider.prefetch_shard(index + 1)
-
-    model.train()
-
-    all_step_time = 0.0
-    eval_loss = None
-    scale_counter_at_1 = 0
-
-    for batch_index_number, batch_index in enumerate(tqdm(dataset_iterator, smoothing=1)):
-
-        if batch_index_number > args.max_steps_per_epoch:
-            logger.info("Max steps per epochs reached. Resuming to next epoch ...")
-            break
-
-        if batch_index_number >= len(dataset_iterator) - 1:
-            # skip last batch
-            continue
-
-        try:
-            step_start = time.time()
-
-            batch = pretrain_dataset_provider.get_batch(batch_index)
-            batch = tuple(t.to(args.device) for t in batch)  # Move to GPU
-
-            total_loss = model.forward(batch)
-
-            unscaled_loss = total_loss.item()
-            current_data_sample_count += args.train_micro_batch_size_per_gpu * dist.get_world_size()
-
-            # Prefetch training data
-            pretrain_dataset_provider.prefetch_batch()
-
-            model.network.backward(total_loss)
-
-            total_loss = None
-
-            if model.network.is_gradient_accumulation_boundary():
-                report_metrics(
-                    args,
-                    lr_scheduler.get_last_lr(),
-                    unscaled_loss,
-                    global_step,
-                    current_data_sample_count,
-                )
-
-                model.network.step()
-                global_step += 1
-
-                # HACK: add to scale counter if stuck at scale 1 (to detect possible NaN (diverged model))
-                if args.fp16 and optimizer.cur_scale == 1:
-                    scale_counter_at_1 += 1
-                    logger.info(f"Optimizer scale=={scale_counter_at_1}")
-
-                if scale_counter_at_1 >= args.scale_cnt_limit:
-                    logger.warning("Optimizer scale==1 counter has been reached")
-                    del batch
-                    break
-            else:
-                # Call DeepSpeed engine step on micro steps
-                model.network.step()
-
-        except StopIteration:
-            continue
-
-        step_time = time.time() - step_start
-        all_step_time += step_time
-        if (
-            global_step % args.log_throughput_every == 0
-            and global_step != 0
-            and model.network.is_gradient_accumulation_boundary()
-            and dist.get_rank() == 0
-        ):
-            one_step_bs = (
-                args.train_micro_batch_size_per_gpu
-                * args.gradient_accumulation_steps
-                * dist.get_world_size()
-                * args.log_throughput_every
-            )
-            logger.info(
-                "At step {}, the throughput is {:2f} Samples/s".format(
-                    global_step * args.gradient_accumulation_steps, one_step_bs / all_step_time
-                )
-            )
-            all_step_time = 0.0
-
-        del batch
-
-    torch.cuda.synchronize()
-    dist.barrier(model.network.data_parallel_group)
-
-    pretrain_dataset_provider.release_shard(index)
-    global_data_samples = current_data_sample_count
-
-    logger.info(f"Epoch {index}: check whether to run validation...")
-    if validation_dataset is not None and scale_counter_at_1 < args.scale_cnt_limit:
-        time_diff = get_time_diff_hours(get_now(), args.exp_start_marker)
-        if should_run_validation(time_diff, args, epoch=index):
-            eval_loss = pretrain_validation(args, model, validation_dataset, global_step)
-
-    logger.info(f"Epoch {index}: check if time to save a fine-tune checkpoint")
-    if (
-        is_time_to_finetune(
-            get_now(),
-            args.exp_start_marker,
-            args.finetune_time_markers,
-            args.total_training_time,
-        )
-        and master_process(args)
-        and scale_counter_at_1 < args.scale_cnt_limit
-    ):
-        logger.info("Creating a Fine-tune job")
-        create_finetune_job(args, index, global_step, model)
-    return eval_loss, scale_counter_at_1
-
-
-def should_run_validation(time_diff, args, epoch):
-    time_proportion = time_diff / args.total_training_time
-
-    should_do_validation = False
-
-    # is in first stage of training
-    if time_proportion < args.validation_begin_proportion:
-        should_do_validation = epoch % args.validation_epochs_begin == 0
-
-    # is in last stage of training
-    elif time_proportion > 1 - args.validation_end_proportion:
-        should_do_validation = epoch % args.validation_epochs_end == 0
-
-    # is in the middle stage of training
-    else:
-        should_do_validation = epoch % args.validation_epochs == 0
-
-    return should_do_validation
-
-
-def report_metrics(args, lr, loss, step, data_sample_count):
-    current_lr = lr[0] if type(lr) == list else lr
-    if master_process(args):
-        if _has_wandb:
-            log_info = {
-                f"train/lr": current_lr,
-                f"train/train_loss": loss,
-            }
-            wandb.log(log_info, step=step)
-            samp_info = {
-                f"Train/Samples/train_loss": loss,
-                f"Train/Samples/lr": current_lr,
-                f"Train/total_samples": data_sample_count,
-            }
-            wandb.log(samp_info, commit=False)
-
-    if (step + 1) % args.print_steps == 0 and master_process(args):
-        logger.info(
-            f"pre-training progress: step={step + 1}, loss={loss}, lr={current_lr}, sample_count={data_sample_count}"
-        )
-
-
-def merge_args(arg_list):
-    args = Namespace()
-    for cur_args in arg_list:
-        for key, value in cur_args.__dict__.items():
-            setattr(args, key, value)
-    return args
-
-
-def get_arguments():
-    parser = HfArgumentParser(
-        (
-            DeepspeedArguments,
-            ModelArguments,
-            ModelConfigArguments,
-            PreTrainDatasetArguments,
-            OptimizerArguments,
-            PretrainScriptParamsArguments,
-            SchedulerArgs,
-        )
-    )
-
-    (
-        ds_args,
-        model_args,
-        model_config_args,
-        dataset_args,
-        optimizer_args,
-        train_args,
-        schedule_args,
-    ) = parser.parse_args_into_dataclasses()
-
-    args = merge_args([ds_args, model_args, dataset_args, train_args])
-    args.model_config = vars(model_config_args)
-    args.optimizer_args = optimizer_args
-    args.schedule_args = schedule_args
-    return args
+global logger
+import pdb
 
 
 def create_ds_config(args):
@@ -391,7 +98,9 @@ def create_ds_config(args):
 
 def parse_arguments():
     """Parse all the arguments needed for the training process"""
+    global logger
     args = get_arguments()
+    logger = Logger(cuda=torch.cuda.is_available(), args=args)
     set_seeds(args.seed)
     args.logger = logger
     args.ds_config = create_ds_config(args)
@@ -403,6 +112,320 @@ def parse_arguments():
     args.saved_model_path = os.path.join(args.output_dir, args.job_name, args.current_run_id)
     return args
 
+
+
+def get_arguments():
+    parser = HfArgumentParser(
+        (
+            DeepspeedArguments,
+            ModelArguments,
+            ModelConfigArguments,
+            PreTrainDatasetArguments,
+            OptimizerArguments,
+            PretrainScriptParamsArguments,
+            SchedulerArgs,
+        )
+    )
+
+    (
+        ds_args,
+        model_args,
+        model_config_args,
+        dataset_args,
+        optimizer_args,
+        train_args,
+        schedule_args,
+    ) = parser.parse_args_into_dataclasses()
+
+    args = merge_args([ds_args, model_args, dataset_args, train_args])
+    args.model_config = vars(model_config_args)
+    args.optimizer_args = optimizer_args
+    args.schedule_args = schedule_args
+    return args
+
+def merge_args(arg_list):
+    args = Namespace()
+    for cur_args in arg_list:
+        for key, value in cur_args.__dict__.items():
+            setattr(args, key, value)
+    return args
+
+args = parse_arguments()
+
+
+_has_wandb = True
+import wandb
+
+
+global_step = 0
+global_data_samples = 0
+
+
+def get_valid_dataloader(args, dataset: Dataset):
+    if args.local_rank == -1:
+        train_sampler = RandomSampler(dataset)
+    else:
+        train_sampler = DistributedSampler(dataset)
+    return (
+        x
+        for x in DataLoader(
+            dataset,
+            batch_size=args.validation_micro_batch,
+            sampler=train_sampler,
+            num_workers=0,
+            pin_memory=True,
+        )
+    )
+
+
+validation_shard_index = 0
+
+
+def pretrain_validation(args, model, validation_dataset, step):
+    global validation_shard_index
+
+    logger.info(f"Validation micro batch size: {args.validation_micro_batch}")
+    index = validation_shard_index
+    validation_shard_index += 1
+    model.eval()
+    dataset = validation_dataset.get_validation_set(index)
+    data_batches = get_valid_dataloader(args, dataset)
+    eval_loss = 0
+    num_eval_steps = 0
+    for _, batch in enumerate(tqdm(data_batches, smoothing=1)):
+        batch = tuple(t.to(args.device) for t in batch)
+
+        total_loss = model.forward(batch)
+
+        torch.cuda.synchronize()
+        # using all_reduce is IMPORTANT! it ensures validation loss consistency across all threads
+        dist.all_reduce(total_loss)
+        total_loss = total_loss / dist.get_world_size()
+        eval_loss += total_loss.mean().item()
+        num_eval_steps += 1
+    eval_loss = eval_loss / num_eval_steps
+
+    logger.info(f"Validation Loss for epoch/step {index + 1}/{step} is: {eval_loss}")
+    if master_process(args):
+        if _has_wandb:
+            log_info = {
+                f"Validation/Loss": eval_loss,
+            }
+            wandb.log(log_info, step=step)
+    del dataset
+    del data_batches
+    del batch
+    model.train()
+    return eval_loss
+
+
+def create_finetune_job(args, index, global_step, model, is_last=False, is_best=False, eval_loss=0.):
+    try:
+        if is_last:
+            checkpoint_id = f"epoch{index}_step{global_step}"
+        elif is_best:
+            checkpoint_id = f"eval_best_epoch_step"
+        model.save_weights(
+            checkpoint_id=checkpoint_id,
+            output_dir=args.saved_model_path,
+            is_deepspeed=args.deepspeed,
+        )
+        logger.info("Saved fine-tuning job.")
+    except Exception as e:
+        logger.warning("Finetune checkpoint failed.")
+        logger.warning(e)
+
+
+def train(
+    args, index, model, optimizer, lr_scheduler, pretrain_dataset_provider, validation_dataset=None, best_eval=100000
+):
+    global global_step
+    global global_data_samples
+
+
+    dataset_iterator, total_length = pretrain_dataset_provider.get_shard(index)
+    current_data_sample_count = global_data_samples
+
+    logger.info(
+        f"worker-{dist.get_rank()}: begin epoch {index} current_sample_count {current_data_sample_count} shard_length {total_length} global_data_samples {global_data_samples}"
+    )
+
+    pretrain_dataset_provider.prefetch_shard(index + 1)
+
+    model.train()
+    all_step_time = 0.0
+    eval_loss = None
+    scale_counter_at_1 = 0
+    for batch_index_number, batch_index in enumerate(tqdm(dataset_iterator, smoothing=1)):
+
+        if batch_index_number > args.max_steps_per_epoch:
+            logger.info("Max steps per epochs reached. Resuming to next epoch ...")
+            break
+
+        if batch_index_number >= len(dataset_iterator) - 1:
+            # skip last batch
+            continue
+
+        try:
+            step_start = time.time()
+            batch = pretrain_dataset_provider.get_batch(batch_index)
+            batch = tuple(t.to(args.device) for t in batch)  # Move to GPU
+
+            total_loss = model.forward(batch)
+
+            unscaled_loss = total_loss.item()
+            current_data_sample_count += args.train_micro_batch_size_per_gpu * dist.get_world_size()
+
+            # Prefetch training data
+            pretrain_dataset_provider.prefetch_batch()
+
+            model.network.backward(total_loss)
+
+            total_loss = None
+            if model.network.is_gradient_accumulation_boundary():
+                report_metrics(
+                    args,
+                    lr_scheduler.get_last_lr(),
+                    unscaled_loss,
+                    global_step,
+                    current_data_sample_count,
+                )
+
+                model.network.step()
+                global_step += 1
+
+                # HACK: add to scale counter if stuck at scale 1 (to detect possible NaN (diverged model))
+                if args.fp16 and optimizer.cur_scale == 1:
+                    scale_counter_at_1 += 1
+                    logger.info(f"Optimizer scale=={scale_counter_at_1}")
+
+                if scale_counter_at_1 >= args.scale_cnt_limit:
+                    logger.warning("Optimizer scale==1 counter has been reached")
+                    del batch
+                    break
+            else:
+                # Call DeepSpeed engine step on micro steps
+                model.network.step()
+                '''
+                                if global_step > 28:
+                    for n, v in model.network.named_parameters():
+                        if "intermediate" in n:
+                            print(n, "mean: ", v.grad.mean().cpu().numpy(), "max/min: ", v.grad.max().cpu().numpy(), "  ", v.grad.min().cpu().numpy())
+                    for n, v in model.network.named_parameters():
+                        if "augs" in n:
+                            print(n, "mean: ", v.grad.mean().cpu().numpy(), "max/min: ", v.grad.max().cpu().numpy(), "  ", v.grad.min().cpu().numpy())
+                    pdb.set_trace()
+                '''
+
+
+        except StopIteration:
+            continue
+
+        step_time = time.time() - step_start
+        all_step_time += step_time
+        if (
+            global_step % args.log_throughput_every == 0
+            and global_step != 0
+            and model.network.is_gradient_accumulation_boundary()
+            and dist.get_rank() == 0
+        ):
+            one_step_bs = (
+                args.train_micro_batch_size_per_gpu
+                * args.gradient_accumulation_steps
+                * dist.get_world_size()
+                * args.log_throughput_every
+            )
+            logger.info(
+                "At step {}, the throughput is {:2f} Samples/s".format(
+                    global_step * args.gradient_accumulation_steps, one_step_bs / all_step_time
+                )
+            )
+            all_step_time = 0.0
+
+        del batch
+
+    torch.cuda.synchronize()
+    dist.barrier(model.network.data_parallel_group)
+
+    pretrain_dataset_provider.release_shard(index)
+    global_data_samples = current_data_sample_count
+
+    logger.info(f"Epoch {index}: check whether to run validation...")
+    if validation_dataset is not None and scale_counter_at_1 < args.scale_cnt_limit:
+        time_diff = get_time_diff_hours(get_now(), args.exp_start_marker)
+        if should_run_validation(time_diff, args, epoch=index):
+            eval_loss = pretrain_validation(args, model, validation_dataset, global_step)
+
+    if eval_loss is not None:
+        if eval_loss <= best_eval:
+            is_best = True
+            best_eval = eval_loss
+        else:
+            is_best = False
+    else:
+        is_best = False
+
+    is_last = (args.max_steps - global_step) <= 5
+
+    logger.info(f"Epoch {index}: check if time to save a fine-tune checkpoint")
+    if (
+        is_to_finetune(
+            is_last=is_last,
+            is_best=is_best,
+            global_step=global_step,
+            max_step=args.max_steps
+        )
+        and master_process(args)
+        and scale_counter_at_1 < args.scale_cnt_limit
+    ):
+        logger.info("Creating a Fine-tune job")
+        create_finetune_job(args, index, global_step, model, is_last, is_best, eval_loss)
+    return eval_loss, scale_counter_at_1, best_eval
+
+
+def should_run_validation(time_diff, args, epoch):
+    time_proportion = time_diff / args.total_training_time
+
+    should_do_validation = False
+
+    # is in first stage of training
+    if time_proportion < args.validation_begin_proportion:
+        should_do_validation = epoch % args.validation_epochs_begin == 0
+
+    # is in last stage of training
+    elif time_proportion > 1 - args.validation_end_proportion:
+        should_do_validation = epoch % args.validation_epochs_end == 0
+
+    # is in the middle stage of training
+    else:
+        should_do_validation = epoch % args.validation_epochs == 0
+
+    return should_do_validation
+
+
+def report_metrics(args, lr, loss, step, data_sample_count):
+    current_lr = lr[0] if type(lr) == list else lr
+    if master_process(args):
+        if _has_wandb:
+            log_info = {
+                f"train/lr": current_lr,
+                f"train/train_loss": loss,
+            }
+            wandb.log(log_info, step=step)
+            samp_info = {
+                f"Train/Samples/train_loss": loss,
+                f"Train/Samples/lr": current_lr,
+                f"Train/total_samples": data_sample_count,
+            }
+            wandb.log(samp_info, commit=False)
+            wandb.log({
+                "step": step
+            })
+
+    if (step + 1) % args.print_steps == 0 and master_process(args):
+        logger.info(
+            f"pre-training progress: step={step + 1}, loss={loss}, lr={current_lr}, sample_count={data_sample_count}"
+        )
 
 def prepare_optimizer_parameters(args, model):
     param_optimizer = list(model.network.named_parameters())
@@ -459,12 +482,14 @@ def prepare_model_and_optimizer(args):
 def check_if_early_stop(eval_loss, scale_counter, args):
     # check if the validation loss is already NaN and stop
     if eval_loss is not None and np.isnan(eval_loss):
+        logger.info("early exit because loss in nan !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
         return True
 
     if scale_counter >= args.scale_cnt_limit:
+        logger.info("early exit because scale_counter !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
         return True
-
-    time_diff = get_time_diff_hours(get_now(), args.exp_start_marker)
+    '''
+        time_diff = get_time_diff_hours(get_now(), args.exp_start_marker)
     time_diff_minutes = time_diff * 60
 
     loss_to_compare_to = args.early_stop_eval_loss
@@ -486,6 +511,8 @@ def check_if_early_stop(eval_loss, scale_counter, args):
 
     return should_stop
 
+    '''
+
 
 def load_datasets(args):
     if "per_device" in args.data_loader_type:
@@ -500,16 +527,16 @@ def start_training(args, model, optimizer, lr_scheduler, start_epoch):
     """Training loop (epochs, and detect points of exit)"""
     global global_step
     global global_data_samples
-
     pretrain_dataset_provider, validation_dataset = load_datasets(args)
 
     last_epoch = 0
+    best_eval = 10000
+    should_early_stop = False
     for index in range(start_epoch, args.num_epochs):
         last_epoch = index
         logger.info(f"Training Epoch: {index}")
         pre = time.time()
-
-        eval_loss, scale_counter = train(
+        eval_loss, scale_counter, best_eval = train(
             args,
             index,
             model,
@@ -517,6 +544,7 @@ def start_training(args, model, optimizer, lr_scheduler, start_epoch):
             lr_scheduler,
             pretrain_dataset_provider,
             validation_dataset,
+            best_eval
         )
 
         post = time.time()
@@ -529,7 +557,9 @@ def start_training(args, model, optimizer, lr_scheduler, start_epoch):
         )
 
         # check if training reached a stopping point
-        if is_time_to_exit(get_now(), args=args, global_steps=global_step) or should_early_stop:
+
+       # if is_time_to_exit(get_now(), args=args, global_steps=global_step) or should_early_stop:
+        if global_step >= args.max_steps or should_early_stop:
             logger.info(
                 f"Warning: Early training termination due to max steps limit or time limit, \
                     epoch={index}, global_step={global_step}"
@@ -538,9 +568,9 @@ def start_training(args, model, optimizer, lr_scheduler, start_epoch):
 
         # save a checkpoint
         if (
-            index > 0
+                (index > 0
             and args.num_epochs_between_checkpoints > 0
-            and index % args.num_epochs_between_checkpoints == 0
+            and index % args.num_epochs_between_checkpoints == 0) or (args.max_steps - global_step < 5)
         ):
             logger.info(f"Process rank - {dist.get_rank()} - attempting to save checkpoint")
             save_training_checkpoint(
@@ -569,7 +599,7 @@ def start_training(args, model, optimizer, lr_scheduler, start_epoch):
         last_global_step=global_step,
         last_global_data_samples=global_data_samples,
         exp_start_marker=args.exp_start_marker,
-        ckpt_id="latest_checkpoint",
+        ckpt_id="latest_checkpoint" if not should_early_stop else "should_early_stop_ckpt",
     )
 
     logger.info("Waiting for all processes (barrier)")
@@ -588,12 +618,12 @@ def setup_wandb(args, model, resume_id=None):
             wandb.init(
                 project=args.project_name,
                 group=args.job_name,
-                dir="/tmp",
+                dir=args.output_dir,
                 resume="allow",
                 id=resume_id,
             )
         else:
-            wandb.init(project=args.project_name, group=args.job_name, dir="/tmp")
+            wandb.init(project=args.project_name, group=args.job_name, dir=args.output_dir)
         wandb.config.update(args, allow_val_change=True)
         wandb.watch(model)
     else:
@@ -682,10 +712,11 @@ def prepare_resuming_checkpoint(args, model):
 
 
 def main():
+
     start_time = time.time()
-    args = parse_arguments()
     args.exp_start_marker = get_now()
     model, optimizer, lr_scheduler = prepare_model_and_optimizer(args)
+    logger.info(model)
 
     start_epoch = 0
     wandb_run_id = None

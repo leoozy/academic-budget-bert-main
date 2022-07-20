@@ -2,31 +2,52 @@
 <project version="4">
   <component name="PublishConfigData" remoteFilesAllowedToDisappearOnAutoupload="false">
     <serverData>
+      <paths name="125">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/zjl/code/24hb" local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="141">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/wp/code/24hbert" local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="141 (project level)">
+        <serverdata>
+          <mappings>
+            <mapping local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="143">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/zjl/24hbert" local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="162">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/code/24hb" local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="170">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/code/24hbert" local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
       <paths name="sysadmin@172.16.75.125:22 password">
         <serverdata>
           <mappings>
             <mapping local="$PROJECT_DIR$" web="/" />
-          </mappings>
-        </serverdata>
-      </paths>
-      <paths name="sysadmin@172.16.75.144:22 password">
-        <serverdata>
-          <mappings>
-            <mapping local="$PROJECT_DIR$" web="/" />
-          </mappings>
-        </serverdata>
-      </paths>
-      <paths name="zhangjunlei@172.16.55.170:22 password">
-        <serverdata>
-          <mappings>
-            <mapping local="$PROJECT_DIR$" web="/" />
-          </mappings>
-        </serverdata>
-      </paths>
-      <paths name="zhangjunlei@172.16.55.170:22 password (1)">
-        <serverdata>
-          <mappings>
-            <mapping deploy="/code/24hbert" local="$PROJECT_DIR$" web="/" />
           </mappings>
         </serverdata>
       </paths>
