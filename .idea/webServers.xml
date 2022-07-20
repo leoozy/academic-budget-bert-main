@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="WebServers">
+    <option name="servers">
+      <webServer id="ffec376a-1035-4b59-84c3-0a2bd89aeb46" name="141 (project level)">
+        <fileTransfer rootFolder="/home/sysadmin" accessType="SFTP" host="172.16.75.141" port="22" sshConfigId="4ba9d898-7b3b-466a-b0b3-f3b694c8cd63" sshConfig="sysadmin@172.16.75.141:22 password">
+          <advancedOptions>
+            <advancedOptions dataProtectionLevel="Private" keepAliveTimeout="0" passiveMode="true" shareSSLContext="true" />
+          </advancedOptions>
+        </fileTransfer>
+      </webServer>
+      <webServer id="7c60716d-5468-4346-99b2-17f757394f77" name="125">
+        <fileTransfer rootFolder="/home/sysadmin" accessType="SFTP" host="172.16.75.125" port="22" sshConfigId="1c66c558-b3de-4072-8991-7932d7c65030" sshConfig="sysadmin@172.16.75.125:22 password">
+          <advancedOptions>
+            <advancedOptions dataProtectionLevel="Private" passiveMode="true" shareSSLContext="true" />
+          </advancedOptions>
+        </fileTransfer>
+      </webServer>
+      <webServer id="d9f558ab-bbf6-4288-ac55-555ed3fdabe3" name="162">
+        <fileTransfer rootFolder="/home/zhangjunlei" accessType="SFTP" host="10.0.1.162" port="22" sshConfigId="61d36142-314b-4563-8102-32679cd09d0e" sshConfig="root@10.0.1.162:22 password">
+          <advancedOptions>
+            <advancedOptions dataProtectionLevel="Private" keepAliveTimeout="0" passiveMode="true" shareSSLContext="true" />
+          </advancedOptions>
+        </fileTransfer>
+      </webServer>
+    </option>
+  </component>
+</project>
